@@ -434,17 +434,6 @@ def _normalize_activities(raw_acts):
     return {name: False for name in ACTIVITY_NAMES}
 
 
-_ELEV_TEMPLATES = None    # lazy-loaded
-
-
-def _get_elev_templates():
-    global _ELEV_TEMPLATES
-    if _ELEV_TEMPLATES is None:
-        from elevation_matching import build_elevation_templates
-        _ELEV_TEMPLATES = build_elevation_templates()
-    return _ELEV_TEMPLATES
-
-
 def extract_path_features(raw, watch_loc=None, activities=None):
     data  = raw['data']
     feats = {}
@@ -527,18 +516,6 @@ def extract_path_features(raw, watch_loc=None, activities=None):
     feats.update(_acc_independent_stair_features(
         data, stair_mask_for_acc, prs_sr, watch_loc=watch_loc))
 
-    # Elevation profile matching against GPX path templates (4 metrics × 5 paths)
-    from elevation_matching import match_recording_elevation
-    feats.update(match_recording_elevation(raw, _get_elev_templates()))
-
-    # Trajectory matching: gyro-integrated heading binned by elevation
-    from path_reconstruction import (build_path_templates,
-                                       match_recording_to_templates)
-    if not hasattr(extract_path_features, '_traj_templates'):
-        extract_path_features._traj_templates = build_path_templates()
-    feats.update(match_recording_to_templates(
-        raw, extract_path_features._traj_templates))
-
     return feats
 
 
@@ -605,23 +582,6 @@ FEATURE_COLS_RAW = [
     'acc_stair_walk_ratio',
     'acc_stair_std', 'acc_flat_std', 'acc_stair_mean',
     'acc_stair_gyro_std', 'acc_stair_cadence',
-    # GPX-template elevation profile matching (4 metrics × 5 paths + aggregates)
-    'elev_l2_raw_p0', 'elev_l2_raw_p1', 'elev_l2_raw_p2', 'elev_l2_raw_p3', 'elev_l2_raw_p4',
-    'elev_l2_shape_p0', 'elev_l2_shape_p1', 'elev_l2_shape_p2', 'elev_l2_shape_p3', 'elev_l2_shape_p4',
-    'elev_corr_p0', 'elev_corr_p1', 'elev_corr_p2', 'elev_corr_p3', 'elev_corr_p4',
-    'elev_dtw_p0', 'elev_dtw_p1', 'elev_dtw_p2', 'elev_dtw_p3', 'elev_dtw_p4',
-    'elev_best_match_l2', 'elev_best_match_corr',
-    'elev_total_change', 'elev_abs_total',
-    'elev_steepest_pos', 'elev_steepest_mag', 'elev_flat_frac',
-    'elev_climb_p25_pos', 'elev_climb_p50_pos', 'elev_climb_p75_pos',
-    # Trajectory matching: cumulative-turn signal from gyro-integrated heading
-    # binned by elevation, compared to GPX templates with 4 distance metrics.
-    'traj_dtw_p0', 'traj_dtw_p1', 'traj_dtw_p2', 'traj_dtw_p3', 'traj_dtw_p4',
-    'traj_l2_p0', 'traj_l2_p1', 'traj_l2_p2', 'traj_l2_p3', 'traj_l2_p4',
-    'traj_corr_p0', 'traj_corr_p1', 'traj_corr_p2', 'traj_corr_p3', 'traj_corr_p4',
-    'traj_frechet_p0', 'traj_frechet_p1', 'traj_frechet_p2', 'traj_frechet_p3', 'traj_frechet_p4',
-    'traj_n_bins', 'traj_sign',
-    'traj_best_match_dtw', 'traj_best_match_corr', 'traj_best_match_dist',
 ]
 
 N_HEADING_SEGMENTS = 10
