@@ -75,8 +75,11 @@ df = pd.read_csv(FEATURES_TRAIN)
 
 # Watch location features
 df_wl = twl.engineer_features(df)
-X_wl = df_wl[twl.FEATURE_COLS].values.astype(float)
 y_wl = df_wl[twl.LABEL].values.astype(int)
+wl_feature_cols = twl.select_feature_cols(df_wl, y_wl)
+X_wl = df_wl[wl_feature_cols].values.astype(float)
+if len(wl_feature_cols) < len(twl.FEATURE_COLS):
+    print(f'Watch pruning: top-{len(wl_feature_cols)} features')
 
 # Path features — use OOF predictions for activities/watch_loc to match the
 # inference distribution (saved model is trained the same way).
@@ -85,6 +88,19 @@ print('Extracting path features for CV ...')
 df_path_raw, y_path = tp.load_data(tp.DATA_TRAIN, has_labels=True, oof_csv=oof_csv)
 df_path, path_feat_cols = tp._merge_csv_features(df_path_raw, FEATURES_TRAIN, tp.HEADING_COLS)
 X_path = df_path[path_feat_cols].values.astype(float)
+if getattr(tp, 'PATH_TOP_K_FEATURES', None) is not None and tp.PATH_TOP_K_FEATURES < len(path_feat_cols):
+    rank_pipe = Pipeline([
+        ('imp', SimpleImputer(strategy='median')),
+        ('clf', GradientBoostingClassifier(
+            n_estimators=153, max_depth=3, learning_rate=0.114,
+            min_samples_leaf=7, subsample=0.819, random_state=RANDOM_STATE)),
+    ])
+    rank_pipe.fit(X_path, y_path)
+    rank = np.argsort(rank_pipe['clf'].feature_importances_)[::-1]
+    keep = rank[:tp.PATH_TOP_K_FEATURES]
+    path_feat_cols = [path_feat_cols[i] for i in keep]
+    X_path = X_path[:, keep]
+    print(f'Path pruning: top-{tp.PATH_TOP_K_FEATURES} features')
 
 # Activities — per-activity feature subsets handled in the loop below
 
@@ -142,7 +158,9 @@ for act in tact.ACTIVITIES:
     feat_cols = tact.feature_cols_for(act)
     X_act = df[feat_cols].values.astype(float)
     pipe = tact.make_pipe(act)
-    preds = cross_val_predict(pipe, X_act, y_a, cv=cv, n_jobs=1)
+    proba = cross_val_predict(pipe, X_act, y_a, cv=cv,
+                              method='predict_proba', n_jobs=1)[:, 1]
+    preds = (proba >= tact.ACTIVITY_THRESHOLDS.get(act, 0.5)).astype(int)
     adj, bal = adjusted_balanced_acc(y_a, preds, n_classes=2)
     act_results[act] = {'bal': bal, 'adj': adj}
     print(f'  {act:<10s} bal={bal:.4f}  adjusted={adj:.4f}')

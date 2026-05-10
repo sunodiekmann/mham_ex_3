@@ -45,6 +45,7 @@ STAIR_THRESH_HPA_S   = 0.025   # hPa/s
 MIN_STAIR_DURATION_S = 8.0     # ignore bursts shorter than this
 GPS_CORRUPTION_RANGE = 10.0    # m — altitude_range below this → GPS is frozen/broken
 PRESSURE_TO_METRES   = -8.3    # hPa → m  (ΔP × -8.3 ≈ Δh)
+PATH_TOP_K_FEATURES  = 90      # importance-pruned no-GPX feature set
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,132 @@ def _stair_features(prs, sr):
         np.sum(np.sort(abs_deriv)[-n_top:]) / (abs_deriv.sum() + 1e-9))
 
     return feats, default_mask
+
+
+ALT_RATE_KEYS = [
+    'alt_rate_total_per_s',         # signed total alt change per second
+    'alt_rate_early_per_s',         # signed alt change rate, first third
+    'alt_rate_mid_per_s',           # signed alt change rate, middle third
+    'alt_rate_late_per_s',          # signed alt change rate, last third
+    'alt_rate_early_vs_late_ratio', # |early_rate| / max(|late_rate|, eps)
+]
+
+
+def _alt_rate_features(prs, sr, duration):
+    """
+    Altitude-change rates derived from barometric pressure.
+    Captures uphill-vs-downhill speed (downhill is faster) and intra-recording
+    pace shifts (e.g. P1 has steep early third because of stairs early).
+    Per-third rates plus an early/late ratio; absolute-only summaries had
+    univ_bal ≤ chance (0.21) in the discrimination audit and were dropped.
+    """
+    feats = {k: np.nan for k in ALT_RATE_KEYS}
+    if sr <= 0 or len(prs) < 20 or duration <= 0:
+        return feats
+    smooth = uniform_filter1d(prs.astype(float), size=max(3, int(sr * 5)))
+    total_alt = float((smooth[-1] - smooth[0]) * PRESSURE_TO_METRES)
+    feats['alt_rate_total_per_s'] = total_alt / duration
+
+    n = len(smooth)
+    third  = max(1, n // 3)
+    dur_t  = duration / 3.0
+    early  = float((smooth[third]      - smooth[0])      * PRESSURE_TO_METRES)
+    mid    = float((smooth[2 * third]  - smooth[third])  * PRESSURE_TO_METRES)
+    late   = float((smooth[-1]         - smooth[2 * third]) * PRESSURE_TO_METRES)
+
+    feats['alt_rate_early_per_s'] = early / dur_t
+    feats['alt_rate_mid_per_s']   = mid   / dur_t
+    feats['alt_rate_late_per_s']  = late  / dur_t
+    feats['alt_rate_early_vs_late_ratio'] = float(
+        abs(early) / (abs(late) + 1e-3))
+    return feats
+
+
+PRESSURE_SHAPE_KEYS = (
+    [f'pressure_reach_{pct}_frac' for pct in (10, 25, 50, 75, 90)] +
+    ['pressure_slope_mean', 'pressure_slope_mean_abs',
+     'pressure_slope_std', 'pressure_slope_p90_abs',
+     'pressure_slope_p95_abs', 'pressure_slope_p99_abs',
+     'pressure_slope_max_up', 'pressure_slope_max_down',
+     'pressure_slope_max_abs_pos',
+     'pressure_flat_frac', 'pressure_moderate_frac', 'pressure_steep_frac'] +
+    [f'pressure_slope_{part}_{stat}'
+     for part in ('early', 'mid', 'late')
+     for stat in ('mean', 'mean_abs', 'p90_abs')] +
+    [f'pressure_roll_{win}s_{stat}'
+     for win in (5, 10, 20)
+     for stat in ('max_up', 'max_down', 'max_abs', 'max_abs_pos')]
+)
+
+
+def _pressure_shape_features(prs, sr):
+    """
+    Recording-only pressure shape descriptors: inverse progress timing,
+    multi-scale vertical slope, and flat/steep fractions. No route templates.
+    """
+    feats = {k: np.nan for k in PRESSURE_SHAPE_KEYS}
+    if sr <= 0 or len(prs) < 20:
+        return feats
+
+    smooth = uniform_filter1d(prs.astype(float), size=max(3, int(sr * 5)))
+    total_delta = smooth[-1] - smooth[0]
+
+    if abs(total_delta) > 0.5:
+        prog = (smooth - smooth[0]) / total_delta
+        prog_mono = np.maximum.accumulate(prog)
+        n = len(prog_mono)
+        for pct in (10, 25, 50, 75, 90):
+            q = pct / 100.0
+            hits = np.where(prog_mono >= q)[0]
+            feats[f'pressure_reach_{pct}_frac'] = (
+                float(hits[0] / max(n - 1, 1)) if len(hits) else 1.0
+            )
+
+    elev = (smooth - smooth[0]) * PRESSURE_TO_METRES
+    slope = np.diff(smooth) * sr * PRESSURE_TO_METRES
+    abs_slope = np.abs(slope)
+    if len(slope) == 0:
+        return feats
+
+    feats['pressure_slope_mean'] = float(np.mean(slope))
+    feats['pressure_slope_mean_abs'] = float(np.mean(abs_slope))
+    feats['pressure_slope_std'] = float(np.std(slope))
+    feats['pressure_slope_p90_abs'] = float(np.percentile(abs_slope, 90))
+    feats['pressure_slope_p95_abs'] = float(np.percentile(abs_slope, 95))
+    feats['pressure_slope_p99_abs'] = float(np.percentile(abs_slope, 99))
+    feats['pressure_slope_max_up'] = float(np.max(slope))
+    feats['pressure_slope_max_down'] = float(np.min(slope))
+    feats['pressure_slope_max_abs_pos'] = float(np.argmax(abs_slope) / max(len(abs_slope) - 1, 1))
+    feats['pressure_flat_frac'] = float((abs_slope < 0.03).mean())
+    feats['pressure_moderate_frac'] = float(((abs_slope >= 0.03) & (abs_slope < 0.12)).mean())
+    feats['pressure_steep_frac'] = float((abs_slope >= 0.12).mean())
+
+    parts = {
+        'early': slope[:len(slope) // 3],
+        'mid':   slope[len(slope) // 3: 2 * len(slope) // 3],
+        'late':  slope[2 * len(slope) // 3:],
+    }
+    for part, vals in parts.items():
+        if len(vals) == 0:
+            continue
+        vals_abs = np.abs(vals)
+        feats[f'pressure_slope_{part}_mean'] = float(np.mean(vals))
+        feats[f'pressure_slope_{part}_mean_abs'] = float(np.mean(vals_abs))
+        feats[f'pressure_slope_{part}_p90_abs'] = float(np.percentile(vals_abs, 90))
+
+    for win_s in (5, 10, 20):
+        w = max(2, int(sr * win_s))
+        if len(elev) <= w:
+            continue
+        roll_slope = (elev[w:] - elev[:-w]) / win_s
+        abs_roll = np.abs(roll_slope)
+        feats[f'pressure_roll_{win_s}s_max_up'] = float(np.max(roll_slope))
+        feats[f'pressure_roll_{win_s}s_max_down'] = float(np.min(roll_slope))
+        feats[f'pressure_roll_{win_s}s_max_abs'] = float(np.max(abs_roll))
+        feats[f'pressure_roll_{win_s}s_max_abs_pos'] = float(
+            np.argmax(abs_roll) / max(len(abs_roll) - 1, 1))
+
+    return feats
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +583,7 @@ def extract_path_features(raw, watch_loc=None, activities=None):
         acts['cycling'] and not acts['walking'] and not acts['running']
     )
 
+
     ax_ts = data['ax']['raw_timestamps']
     feats['duration'] = (ax_ts[-1][1] - ax_ts[0][1]) / 1000.0
 
@@ -498,6 +626,8 @@ def extract_path_features(raw, watch_loc=None, activities=None):
 
         stair_feats, stair_mask_for_acc = _stair_features(prs, prs_sr)
         feats.update(stair_feats)
+        feats.update(_pressure_shape_features(prs, prs_sr))
+        feats.update(_alt_rate_features(prs, prs_sr, feats['duration']))
     else:
         for k in ('pressure_start', 'pressure_net_delta', 'pressure_alt_gain',
                   'stair_frac', 'stair_detected',
@@ -508,6 +638,10 @@ def extract_path_features(raw, watch_loc=None, activities=None):
                   'prs_prog_60', 'prs_prog_70', 'prs_prog_80', 'prs_prog_90',
                   'pressure_local_var_p75', 'pressure_local_var_p90',
                   'pressure_burst_ratio', 'pressure_top10_frac'):
+            feats[k] = np.nan
+        for k in PRESSURE_SHAPE_KEYS:
+            feats[k] = np.nan
+        for k in ALT_RATE_KEYS:
             feats[k] = np.nan
 
     feats.update(_acc_stair_features(data, stair_mask_for_acc, prs_sr))
@@ -579,6 +713,8 @@ FEATURE_COLS_RAW = [
     'prs_prog_10', 'prs_prog_20', 'prs_prog_30', 'prs_prog_40', 'prs_prog_50',
     'prs_prog_60', 'prs_prog_70', 'prs_prog_80', 'prs_prog_90',
     'pressure_burst_ratio', 'pressure_top10_frac',
+    *PRESSURE_SHAPE_KEYS,
+    *ALT_RATE_KEYS,
     'acc_stair_walk_ratio',
     'acc_stair_std', 'acc_flat_std', 'acc_stair_mean',
     'acc_stair_gyro_std', 'acc_stair_cadence',
@@ -670,6 +806,18 @@ if __name__ == '__main__':
     print('\nTop feature importances (GBM):')
     for feat, val in imps[:15]:
         print(f'  {feat:35s}  {val:.4f}')
+
+    if PATH_TOP_K_FEATURES is not None and PATH_TOP_K_FEATURES < len(feat_cols):
+        feat_cols_full = feat_cols
+        feat_cols = [feat for feat, _ in imps[:PATH_TOP_K_FEATURES]]
+        X = df_train[feat_cols]
+        print(f'\nPruned feature set: top-{PATH_TOP_K_FEATURES} of {len(feat_cols_full)} features')
+        pipe = build_pipe(gb)
+        pipe.fit(X, y_train)
+        imps = sorted(zip(feat_cols, pipe['clf'].feature_importances_), key=lambda x: -x[1])
+        print('Top feature importances after pruning:')
+        for feat, val in imps[:15]:
+            print(f'  {feat:35s}  {val:.4f}')
 
     y_cv   = cross_val_predict(pipe, X, y_train, cv=skf)
     cv_bal = balanced_accuracy_score(y_train, y_cv)

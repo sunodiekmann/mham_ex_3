@@ -137,6 +137,17 @@ ACTIVITY_GBM_PARAMS = {
                       min_samples_leaf=9, subsample=0.860),
 }
 
+# Tuned on 5-fold out-of-fold probabilities for balanced accuracy. These are
+# used for the submitted activity booleans; downstream path/step context keeps
+# using the classifier's default .predict() labels to avoid changing those
+# already-tested subsystems.
+ACTIVITY_THRESHOLDS = {
+    'standing': 0.070,
+    'walking':  0.915,
+    'running':  0.500,
+    'cycling':  0.065,
+}
+
 
 def make_pipe(activity):
     """Per-activity tuned GBM (replaces SVM+GBM+RF voting ensemble)."""
@@ -172,7 +183,8 @@ if __name__ == '__main__':
         X = df[feat_cols].values.astype(float)
         pipe = make_pipe(activity)
 
-        preds = cross_val_predict(pipe, X, y, cv=cv)
+        proba = cross_val_predict(pipe, X, y, cv=cv, method='predict_proba')[:, 1]
+        preds = (proba >= ACTIVITY_THRESHOLDS.get(activity, 0.5)).astype(int)
         bal   = balanced_accuracy_score(y, preds)
         f1    = f1_score(y, preds, zero_division=0)
 
@@ -228,6 +240,7 @@ if __name__ == '__main__':
         pickle.dump({'models': models,
                      'feature_cols': FEATURE_COLS,                # union (legacy)
                      'feature_cols_per_activity': feature_cols_per_activity,
+                     'thresholds': ACTIVITY_THRESHOLDS,
                      'activities': ACTIVITIES}, f)
     print(f'Models saved: {MODEL_OUT}')
 

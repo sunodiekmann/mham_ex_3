@@ -76,12 +76,19 @@ def predict_recording(raw, wl_model, act_model, sc_data, path_model):
     # 3. Activities (per-activity feature subsets; watch_loc used as context)
     feat_df['watch_loc'] = watch_loc
     activities = {}
+    activities_out = {}
     feat_cols_per = act_model.get('feature_cols_per_activity',
                                    {a: act_model['feature_cols']
                                     for a in act_model['models']})
+    act_thresholds = act_model.get('thresholds', {})
     for act_name, pipe in act_model['models'].items():
         cols = feat_cols_per[act_name]
         activities[act_name] = bool(pipe.predict(feat_df[cols])[0])
+        if hasattr(pipe, 'predict_proba') and act_thresholds:
+            proba = float(pipe.predict_proba(feat_df[cols])[0, 1])
+            activities_out[act_name] = bool(proba >= act_thresholds.get(act_name, 0.5))
+        else:
+            activities_out[act_name] = activities[act_name]
 
     # 4. Step count (per-location best of FREQ/WPD × watch/phone + activity mask)
     loc_entry  = sc_data['params_by_loc'].get(watch_loc, sc_data['params_by_loc'][0])
@@ -110,10 +117,10 @@ def predict_recording(raw, wl_model, act_model, sc_data, path_model):
     return {
         'watch_loc':  watch_loc,
         'path_idx':   path_idx,
-        'standing':   activities.get('standing',  False),
-        'walking':    activities.get('walking',   False),
-        'running':    activities.get('running',   False),
-        'cycling':    activities.get('cycling',   False),
+        'standing':   activities_out.get('standing',  False),
+        'walking':    activities_out.get('walking',   False),
+        'running':    activities_out.get('running',   False),
+        'cycling':    activities_out.get('cycling',   False),
         'step_count': step_count,
     }
 

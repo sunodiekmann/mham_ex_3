@@ -61,6 +61,68 @@ def _lp_filter(sig, sr, cutoff=4.0, order=4):
 
 
 # ---------------------------------------------------------------------------
+# Phone-IMU cycling veto (per-window helper)
+# ---------------------------------------------------------------------------
+
+def _phone_cycling_mask(raw, target_sr, n_target, gyro_thresh=0.4):
+    """
+    Per-sample-on-target-grid boolean: True if phone IMU shows CYCLING in the
+    1s neighbourhood of that sample. Phone is location-invariant (in pocket),
+    so this veto fires regardless of watch_loc.
+
+    Discriminator: phone gyro magnitude std. During cycling, the phone barely
+    rotates with each pedal (no body twist) → very low gyro variance. During
+    walking, hip sway gives sustained gyro motion → high std. Threshold tuned
+    on labelled data; tunable via the params dict.
+
+    Returns a boolean array aligned to a grid of length `n_target` at
+    `target_sr` Hz. True means "phone IMU says cycling here, do not count".
+    """
+    data = raw['data']
+    if not all(k in data for k in ('phone_gx', 'phone_gy', 'phone_gz')):
+        return np.zeros(n_target, dtype=bool)
+
+    pgx = np.array(data['phone_gx']['values'], dtype=float)
+    pgy = np.array(data['phone_gy']['values'], dtype=float)
+    pgz = np.array(data['phone_gz']['values'], dtype=float)
+    n_p = min(len(pgx), len(pgy), len(pgz))
+    if n_p < 8:
+        return np.zeros(n_target, dtype=bool)
+
+    phone_sr = _samplerate(data['phone_gx']['raw_timestamps'], pgx)
+    if phone_sr <= 0:
+        return np.zeros(n_target, dtype=bool)
+
+    pg_mag = _mag(pgx, pgy, pgz)[:n_p]
+
+    # Compute rolling std over ~1s phone-IMU windows, then resample to target.
+    win = max(4, int(phone_sr))   # 1 s
+    if n_p < win:
+        return np.zeros(n_target, dtype=bool)
+
+    # Cumulative stats for O(n) rolling std
+    c1 = np.cumsum(pg_mag, dtype=np.float64)
+    c2 = np.cumsum(pg_mag ** 2, dtype=np.float64)
+    s1 = c1[win:] - c1[:-win]
+    s2 = c2[win:] - c2[:-win]
+    mean = s1 / win
+    var = np.maximum(s2 / win - mean ** 2, 0.0)
+    rolling_std = np.sqrt(var)
+    # Pad to original length
+    pad = np.full(win, rolling_std[0] if len(rolling_std) else 0.0)
+    rolling_std_full = np.concatenate([pad, rolling_std])[:n_p]
+
+    # Cycling window: phone gyro std below threshold
+    cycling_phone = rolling_std_full < gyro_thresh
+
+    # Resample to target grid via nearest-time mapping
+    t_phone   = np.arange(n_p) / phone_sr
+    t_target  = np.arange(n_target) / target_sr
+    idx_map   = np.clip(np.searchsorted(t_phone, t_target), 0, n_p - 1)
+    return cycling_phone[idx_map]
+
+
+# ---------------------------------------------------------------------------
 # Step counting algorithm
 # ---------------------------------------------------------------------------
 

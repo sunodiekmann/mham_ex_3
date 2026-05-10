@@ -45,6 +45,7 @@ MODEL_OUT      = os.path.join(MODELS_DIR, 'watch_loc.pkl')
 
 RANDOM_STATE = 42
 N_FOLDS      = 5
+WATCH_TOP_K_FEATURES = 50
 
 LABEL     = 'watch_loc'
 LOC_NAMES = {0: 'Wrist', 1: 'Belt', 2: 'Ankle'}
@@ -100,6 +101,24 @@ PER_AXIS_GYRO_FEATS = [
 
 FEATURE_COLS = (WATCH_ACC_FEATS + WATCH_GYRO_FEATS + DERIVED_FEATS
                 + ORIENTATION_FEATS + PER_AXIS_DYNAMIC_FEATS + PER_AXIS_GYRO_FEATS)
+
+
+def select_feature_cols(df, y, feature_cols=FEATURE_COLS, top_k=WATCH_TOP_K_FEATURES):
+    """Rank features with a simple GBM and keep the strongest subset."""
+    feature_cols = list(feature_cols)
+    if top_k is None or top_k >= len(feature_cols):
+        return feature_cols
+
+    rank_pipe = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('clf', GradientBoostingClassifier(
+            n_estimators=385, learning_rate=0.086, max_depth=3,
+            min_samples_leaf=4, subsample=0.95, random_state=RANDOM_STATE)),
+    ])
+    X_rank = df[feature_cols].values.astype(float)
+    rank_pipe.fit(X_rank, y)
+    rank = np.argsort(rank_pipe['clf'].feature_importances_)[::-1]
+    return [feature_cols[i] for i in rank[:top_k]]
 
 
 class TwoStageWatchLoc(BaseEstimator, ClassifierMixin):
@@ -176,10 +195,13 @@ if __name__ == '__main__':
 
     df = pd.read_csv(FEATURES_TRAIN)
     df = engineer_features(df)
-    print(f'Loaded {len(df)} training recordings, {len(FEATURE_COLS)} features selected.')
-
-    X = df[FEATURE_COLS].values.astype(float)
     y = df[LABEL].values.astype(int)
+    selected_feature_cols = select_feature_cols(df, y)
+    print(f'Loaded {len(df)} training recordings, {len(selected_feature_cols)} features selected.')
+    if len(selected_feature_cols) < len(FEATURE_COLS):
+        print(f'Feature pruning: top-{len(selected_feature_cols)} of {len(FEATURE_COLS)} watch features')
+
+    X = df[selected_feature_cols].values.astype(float)
     print(f'Class distribution: { {LOC_NAMES[k]: int((y==k).sum()) for k in [0,1,2]} }')
 
     # Two-stage (SVM ankle-vs-rest → GBM wrist-vs-belt) outperforms every
@@ -245,9 +267,9 @@ if __name__ == '__main__':
         f'CV balanced acc = {cv_results["test_balanced_accuracy"].mean():.3f}'
     )
 
-    X_df = pd.DataFrame(X, columns=FEATURE_COLS)
+    X_df = pd.DataFrame(X, columns=selected_feature_cols)
     sep_scores = {}
-    for feat in FEATURE_COLS:
+    for feat in selected_feature_cols:
         vals = [X_df.loc[y == k, feat].values for k in [0, 1, 2]]
         means = [v.mean() for v in vals]
         stds  = [v.std()  for v in vals]
@@ -268,7 +290,13 @@ if __name__ == '__main__':
 
     pipe.fit(X, y)
     with open(MODEL_OUT, 'wb') as f:
-        pickle.dump({'model': pipe, 'feature_cols': FEATURE_COLS, 'label': LABEL}, f)
+        pickle.dump({
+            'model': pipe,
+            'feature_cols': selected_feature_cols,
+            'all_feature_cols': FEATURE_COLS,
+            'label': LABEL,
+            'top_k_features': WATCH_TOP_K_FEATURES,
+        }, f)
     print(f'Final model saved: {MODEL_OUT}')
 
     train_preds = pipe.predict(X)
